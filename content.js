@@ -128,6 +128,11 @@ function findThumbnailsContainer() {
 
 // 保存原始HTML
 var originalThumbnailsHTML = null;
+// 保存原始卡片模板：只在第一次渲染前抓一次。
+// 不能每次从 container 现取——空结果时 container 已被换成"未找到相关礼品"提示，
+// 再取就会把这条提示当成模板，导致之后所有结果卡片都渲染成"未找到相关礼品"。
+var originalTemplateHTML = null;
+var originalTemplateClass = '';
 
 // 显示搜索结果到页面
 function displayResults(results) {
@@ -142,6 +147,15 @@ function displayResults(results) {
         originalThumbnailsHTML = container.innerHTML;
     }
 
+    // 第一次渲染前把真实卡片模板存下来（必须在清空/替换容器之前执行）
+    if (originalTemplateHTML === null) {
+        var tpl = container.querySelector('li');
+        if (tpl) {
+            originalTemplateHTML = tpl.innerHTML;
+            originalTemplateClass = tpl.className;
+        }
+    }
+
     // 无匹配结果时给出提示
     if (!results.length) {
         container.innerHTML = '<li style="list-style:none; width:100%; padding:24px 0; text-align:center; color:#999; font-size:14px;">未找到相关礼品</li>';
@@ -152,9 +166,8 @@ function displayResults(results) {
         return;
     }
 
-    // 获取原始li的模板
-    var templateLi = container.querySelector('li');
-    if (!templateLi) {
+    // 使用第一次保存下来的真实模板（而不是从已被替换过的容器里现取）
+    if (originalTemplateHTML === null) {
         console.log("==> 未找到模板li");
         return;
     }
@@ -165,8 +178,8 @@ function displayResults(results) {
     // 根据模板生成结果
     results.forEach(function(gift) {
         var li = document.createElement('li');
-        li.className = templateLi.className;
-        li.innerHTML = templateLi.innerHTML;
+        li.className = originalTemplateClass;
+        li.innerHTML = originalTemplateHTML;
 
         // 更新图片
         var img = li.querySelector('img');
