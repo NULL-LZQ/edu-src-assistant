@@ -5,8 +5,18 @@ var searchInput = null;
 var searchButton = null;
 var originalList = null;
 var isSearching = false;
-var filterSoldOut = false; // 过滤已兑换开关状态(持久化到storage)
-var quotaCache = {}; // 兑换限制缓存 {giftId: {redeemed, limit, ts}}(持久化到storage)
+
+// ---- 过滤开关状态(持久化到storage) ----
+var filterSoldOut = false;    // 过滤已兑换:隐藏库存为0/已达兑换上限的礼品
+var filterRedeemable = false; // 仅看可兑换:金币够 + 漏洞要求满足 + 未达上限
+
+// ---- 缓存 ----
+var giftInfoCache = {};   // 详情缓存 {id:{redeemed,limit,schools,reqType,req,ts}} 持久化到storage(V2:含兑换要求分析)
+var userDataCache = null; // 用户数据 {coins,coinsOk,vulns,vulnsOk,ts} 内存10分钟
+
+var SEV = { '低危': 1, '中危': 2, '高危': 3, '严重': 4 };
+// 计入兑换资格的漏洞状态(近似平台口径:已收录的漏洞;待审核/未通过不计)
+var ACCEPTED_STATUS = ['等待修复', '已修复', '已发布'];
 
 // 从页面解析礼品数据
 function parseGiftsFromPage(doc) {
@@ -124,48 +134,105 @@ function fuzzySearch(gifts, keyword) {
     });
 }
 
-// 判断礼品是否已兑换完
+// 判断礼品是否已兑换完(库存维度)
 function isSoldOutGift(gift) {
     return gift.soldOut === true;
 }
 
-// 从订单页(/profile/order/)解析兑换记录,仅用于统计展示:返回 {active: 有效订单数, cancelled: 撤销订单数}
-// 注意:订单页链接是 /gift/order/<订单ID>/,不含礼品ID,无法直接映射礼品,故不做过滤依据
-async function fetchOrderStats() {
-    var stats = { active: 0, cancelled: 0, names: [] };
-    try {
-        var res = await fetch('/profile/order/', { credentials: 'same-origin' });
-        if (!res.ok) {
-            console.log("==> 订单页请求失败:", res.status);
-            return stats;
-        }
-        var html = await res.text();
-        var doc = new DOMParser().parseFromString(html, 'text/html');
-
-        doc.querySelectorAll('table tr').forEach(function(tr) {
-            var tds = tr.querySelectorAll('td');
-            if (tds.length < 4) return;
-            var name = (tds[1].textContent || '').trim();
-            if (!name || name === '商品') return;
-            var status = (tds[3].textContent || '').trim();
-            if (status === '撤销') {
-                stats.cancelled++;
-            } else {
-                stats.active++;
-                stats.names.push(name);
-            }
-        });
-        console.log("==> 订单解析完成: 有效" + stats.active + "单, 撤销" + stats.cancelled + "单");
-    } catch (e) {
-        console.log("==> 获取兑换订单失败:", e);
-    }
-    return stats;
+// 从礼品名称提取学校名(作为"来源"字段的补充匹配,学校可能更名)
+function extractSchoolFromName(name) {
+    var s = (name || '').replace(/^礼品[-—_:]*/, '').replace(/原创漏洞证书/g, '');
+    s = s.replace(/(版)?(漏洞报送证书|漏洞报告证书|漏洞挖掘证书|网络安全证书|感谢信|邀请码|电子版).*$/, '');
+    s = s.replace(/[-—_\s]/g, '');
+    return s;
 }
 
-// 获取单个礼品的兑换限制"已兑/上限"(详情页"兑换限制"字段,如 0/1;第一位是当前用户已兑次数)
-async function fetchGiftQuota(giftId) {
-    // 30分钟缓存(已兑次数只有再次兑换才会变)
-    var cached = quotaCache[giftId];
+// 分析描述中的兑换要求(严格模式)
+// 返回 { type: 'NONE'|'EVALUABLE'|'UNEVALUABLE' }
+//   NONE        = 描述中没有任何要求类字样，仅受金币/上限约束
+//   EVALUABLE   = 解析出"提交/报送 X个 某校 某等级漏洞(+时间下限)"，可与漏洞列表比对
+//   UNEVALUABLE = Rank/分数/积分类条件(如"6rank"、"不低于2分"，漏洞列表无分数数据)，
+//                 或描述含要求类字样但句式解析失败 -> 严格起见一律隐藏，避免把不能兑的误报成可兑
+// 已知文案变体:
+//   "兑换要求至少提交过 1 个南开大学的中危或以上级别漏洞。"
+//   "2026年5月1日以后提交过1个中危(或以上级别)漏洞"
+//   "至少在2024年4月8号及以后提交陕西铁路工程职业技术学院所属系统1个高危级别或2个中危漏洞"
+//   "兑换要求不少于1个学校漏洞"
+function analyzeRequirement(desc) {
+    if (!desc) return { type: 'NONE' };
+
+    // 找含"漏洞"且有要求类字样的句子
+    var seg = null;
+    var sentences = desc.split(/[。\n]/);
+    for (var i = 0; i < sentences.length; i++) {
+        var s = sentences[i];
+        if (s.indexOf('漏洞') >= 0 && /(提交|报送|兑换要求|兑换条件|不少于|至少)/.test(s)) {
+            seg = s;
+            break;
+        }
+    }
+
+    var hasHint = /(兑换要求|兑换条件|至少|不少于|积分|rank|提交|报送)/i.test(desc);
+
+    if (!seg) {
+        return hasHint ? { type: 'UNEVALUABLE' } : { type: 'NONE' };
+    }
+
+    // Rank/分数/积分类条件无法从漏洞列表评估 -> 严格隐藏
+    if (/rank|\d+\s*分|积分|分数/i.test(seg)) {
+        return { type: 'UNEVALUABLE' };
+    }
+
+    var req = { count: 1, level: 0, after: null };
+
+    // 数量: "提交/报送...N个" 或 "不少于/至少 N个"，支持中文数字
+    var cm = seg.match(/(?:提交|报送)[^。]{0,60}?(\d+|一|两|二|三|四|五)\s*个/);
+    if (!cm) cm = seg.match(/(?:不少于|至少)\s*(\d+|一|两|二|三|四|五)\s*个/);
+    if (cm) {
+        req.count = ({ '一': 1, '两': 2, '二': 2, '三': 3, '四': 4, '五': 5 }[cm[1]]) || parseInt(cm[1]) || 1;
+    }
+
+    // 危害等级下限
+    var lm = seg.match(/(严重|高危|中危|低危)/);
+    if (lm) req.level = SEV[lm[1]];
+
+    // 时间下限: 兼容 "2026年5月1日以后"/"2024年4月8号及以后"/"2025年6月及以后"/"2026年及以后"
+    var dm = seg.match(/(\d{4})年(\d{1,2})月(\d{1,2})[日号]?/);
+    if (!dm) dm = seg.match(/(\d{4})年(\d{1,2})月/);
+    if (!dm) dm = seg.match(/(\d{4})年/);
+    if (dm) {
+        req.after = new Date(parseInt(dm[1]), dm[2] ? parseInt(dm[2]) - 1 : 0, dm[3] ? parseInt(dm[3]) : 1).getTime();
+    }
+
+    return { type: 'EVALUABLE', req: req };
+}
+
+// 判断用户漏洞记录是否满足兑换要求
+function meetsRequirement(req, schools, vulns) {
+    var count = 0;
+    for (var i = 0; i < vulns.length; i++) {
+        var v = vulns[i];
+        if (!v.accepted) continue; // 只统计已收录(等待修复/已修复)的漏洞
+        if (req.level > 0 && v.level < req.level) continue;
+
+        // 学校匹配:标题命中"来源"或礼品名提取的学校名任一即可
+        var inSchool = schools.length === 0;
+        for (var j = 0; j < schools.length; j++) {
+            if (schools[j] && v.title.indexOf(schools[j]) >= 0) { inSchool = true; break; }
+        }
+        if (!inSchool) continue;
+
+        if (req.after && v.ts && v.ts < req.after) continue;
+        count++;
+        if (count >= req.count) return true;
+    }
+    return false;
+}
+
+// 获取单个礼品详情:兑换限制(已兑/上限) + 来源学校 + 兑换要求分析(严格模式)
+async function fetchGiftInfo(giftId, giftName) {
+    // 30分钟缓存(持久化,刷新页面不重拉)
+    var cached = giftInfoCache[giftId];
     if (cached && Date.now() - cached.ts < 30 * 60 * 1000) {
         return cached;
     }
@@ -173,21 +240,113 @@ async function fetchGiftQuota(giftId) {
     try {
         var res = await fetch('/gift/' + giftId + '/', { credentials: 'same-origin' });
         if (!res.ok) return null;
-        var html = await res.text();
-        var doc = new DOMParser().parseFromString(html, 'text/html');
-        var m = doc.body.textContent.match(/兑换限制[：:]?\s*(\d+)\s*\/\s*(\d+)/);
+        var text = new DOMParser().parseFromString(await res.text(), 'text/html')
+            .body.textContent.replace(/\s+/g, ' ');
+
+        var info = { redeemed: 0, limit: 0, schools: [], reqType: 'NONE', req: null, ts: Date.now() };
+
+        // 兑换限制 "已兑/上限"
+        var m = text.match(/兑换限制\s*(\d+)\s*\/\s*(\d+)/);
         if (m) {
-            var quota = { redeemed: parseInt(m[1]), limit: parseInt(m[2]), ts: Date.now() };
-            quotaCache[giftId] = quota;
-            // 持久化,避免每次刷新页面都重新拉详情
-            chrome.storage.local.set({ 'quotaCache': quotaCache });
-            return quota;
+            info.redeemed = parseInt(m[1]);
+            info.limit = parseInt(m[2]);
         }
-        console.log("==> 礼品" + giftId + "详情页未找到兑换限制字段");
+
+        // 学校匹配列表:详情页"来源"字段 + 礼品名提取(学校可能更名,如"新疆交通职业学院"->"职业技术大学")
+        var sm = text.match(/来源\s+([^\s]+)/);
+        if (sm && sm[1]) info.schools.push(sm[1]);
+        var ns = extractSchoolFromName(giftName);
+        if (ns && info.schools.indexOf(ns) < 0) info.schools.push(ns);
+
+        // 描述 -> 兑换要求分析(严格模式)
+        var di = text.indexOf(' 描述 ');
+        if (di < 0) di = text.indexOf('描述');
+        if (di >= 0) {
+            var ri = text.indexOf(' 返回 ', di);
+            var desc = text.slice(di + 2, ri > di ? ri : di + 800);
+            var an = analyzeRequirement(desc);
+            info.reqType = an.type;
+            if (an.type === 'EVALUABLE') info.req = an.req;
+        }
+
+        giftInfoCache[giftId] = info;
+        return info;
     } catch (e) {
-        console.log("==> 获取礼品" + giftId + "兑换限制失败:", e);
+        console.log("==> 获取礼品" + giftId + "详情失败:", e);
     }
     return null;
+}
+
+// 获取用户数据:金币(/profile/detail/) + 已提交漏洞列表(/profile/post/)
+async function fetchUserData() {
+    // 10分钟内存缓存
+    if (userDataCache && Date.now() - userDataCache.ts < 10 * 60 * 1000) {
+        return userDataCache;
+    }
+
+    var data = { coins: null, coinsOk: false, vulns: [], vulnsOk: false, ts: 0 };
+    try {
+        // 1) 金币余额
+        var r1 = await fetch('/profile/detail/', { credentials: 'same-origin' });
+        if (r1.ok) {
+            var t1 = new DOMParser().parseFromString(await r1.text(), 'text/html')
+                .body.textContent.replace(/\s+/g, ' ');
+            var m1 = t1.match(/金币\s*([\d,]+)\s*个/);
+            if (m1) {
+                data.coins = parseInt(m1[1].replace(/,/g, ''));
+                data.coinsOk = true;
+            }
+        }
+
+        // 2) 漏洞列表(全部页): 时间 | 标题 | 等级 | 状态 | 操作
+        var page = 1;
+        while (page <= 40) {
+            var r = await fetch('/profile/post/' + (page > 1 ? '?page=' + page : ''), { credentials: 'same-origin' });
+            if (!r.ok) break;
+            var doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+            var addedRows = 0;
+
+            doc.querySelectorAll('table tr').forEach(function(tr) {
+                var tds = tr.querySelectorAll('td');
+                if (tds.length < 4) return;
+                var title = (tds[1].textContent || '').replace(/\s+/g, ' ').trim();
+                var level = (tds[2].textContent || '').trim();
+                var status = (tds[3].textContent || '').trim();
+                if (!title) return;
+
+                var accepted = false;
+                for (var s = 0; s < ACCEPTED_STATUS.length; s++) {
+                    if (status.indexOf(ACCEPTED_STATUS[s]) >= 0) { accepted = true; break; }
+                }
+
+                var ts = 0;
+                var dtm = (tds[0].textContent || '').trim().match(/(\d{4})-(\d{2})-(\d{2})/);
+                if (dtm) ts = new Date(parseInt(dtm[1]), parseInt(dtm[2]) - 1, parseInt(dtm[3])).getTime();
+
+                data.vulns.push({ title: title, level: SEV[level] || 0, ts: ts, accepted: accepted });
+                addedRows++;
+            });
+            if (addedRows > 0) data.vulnsOk = true;
+
+            // 是否有下一页
+            var hasNext = false;
+            doc.querySelectorAll('a[href*="page="]').forEach(function(a) {
+                var pm = (a.getAttribute('href') || '').match(/page=(\d+)/);
+                if (pm && parseInt(pm[1]) === page + 1) hasNext = true;
+            });
+            if (!hasNext) break;
+            page++;
+        }
+
+        var acceptedCount = data.vulns.filter(function(v) { return v.accepted; }).length;
+        console.log("==> 用户数据: 金币" + data.coins + ", 漏洞" + data.vulns.length + "条(已收录" + acceptedCount + "条,共" + page + "页)");
+    } catch (e) {
+        console.log("==> 获取用户数据失败:", e);
+    }
+
+    data.ts = Date.now();
+    userDataCache = data;
+    return data;
 }
 
 // 简单并发控制
@@ -215,7 +374,7 @@ async function runWithConcurrency(items, limit, worker) {
     await Promise.all(runners);
 }
 
-// 更新状态提示文字(显示多少件/隐藏多少件)
+// 更新状态提示文字
 function updateFilterStatus(info) {
     var els = document.querySelectorAll('.gift-filter-status');
     els.forEach(function(el) {
@@ -224,13 +383,15 @@ function updateFilterStatus(info) {
             return;
         }
         if (info.loading) {
-            el.textContent = '正在检查兑换限制...';
+            el.textContent = '正在检查兑换条件...';
             return;
         }
         var text = '共 ' + info.shown + ' 件';
         var parts = [];
         if (info.hiddenStock > 0) parts.push('库存为0 ' + info.hiddenStock + ' 件');
-        if (info.hiddenQuota > 0) parts.push('已达兑换上限 ' + info.hiddenQuota + ' 件');
+        if (info.hiddenQuota > 0) parts.push('已达上限 ' + info.hiddenQuota + ' 件');
+        if (info.hiddenCoins > 0) parts.push('金币不足 ' + info.hiddenCoins + ' 件');
+        if (info.hiddenReq > 0) parts.push('要求不符 ' + info.hiddenReq + ' 件');
         if (parts.length > 0) text += ' | 已隐藏：' + parts.join('，');
         el.textContent = text;
     });
@@ -241,9 +402,10 @@ async function applyCurrentView() {
     if (isSearching) return;
 
     var keyword = searchInput ? searchInput.value.trim() : '';
+    var anyFilter = filterSoldOut || filterRedeemable;
 
     // 无搜索词且未开启过滤 -> 恢复原始列表
-    if (!keyword && !filterSoldOut) {
+    if (!keyword && !anyFilter) {
         restoreOriginalList();
         updateFilterStatus(null);
         return;
@@ -251,56 +413,82 @@ async function applyCurrentView() {
 
     isSearching = true;
     try {
-        // 强制重新加载最新数据(保证剩余数量/已兑换状态准确)
+        // 强制重新加载最新数据(保证剩余数量准确)
         console.log("==> 正在重新加载数据...");
         cachedData = await loadAllGifts();
 
         var results = fuzzySearch(cachedData, keyword);
-        var hiddenStock = 0;
-        var hiddenQuota = 0;
+        var hiddenStock = 0, hiddenQuota = 0, hiddenCoins = 0, hiddenReq = 0;
 
-        if (filterSoldOut) {
-            // 第一层:库存为0(已兑换完)的过滤
-            var kept = [];
+        // 第一层:库存为0的礼品任何情况下都不可兑换
+        if (anyFilter) {
+            var kept0 = [];
             results.forEach(function(gift) {
                 if (isSoldOutGift(gift)) {
                     hiddenStock++;
                 } else {
-                    kept.push(gift);
+                    kept0.push(gift);
                 }
             });
-            results = kept;
-
-            if (results.length > 0) {
-                // 第二层:兑换限制过滤
-                // 详情页"兑换限制 已兑/上限"由服务端按个人订单统计(撤销单已扣除),比订单页映射更准
-                updateFilterStatus({ loading: true });
-
-                // 订单统计仅作控制台参考
-                fetchOrderStats();
-
-                // 并发拉详情读取"兑换限制"(并发3,30分钟缓存)
-                await runWithConcurrency(results, 3, async function(gift) {
-                    await fetchGiftQuota(gift.id);
-                });
-
-                // 限兑上限 - 已兑次数 <= 0 => 不能再兑换 => 隐藏
-                kept = [];
-                results.forEach(function(gift) {
-                    var q = quotaCache[gift.id];
-                    if (q && q.limit > 0 && q.redeemed >= q.limit) {
-                        hiddenQuota++;
-                    } else {
-                        kept.push(gift);
-                    }
-                });
-                results = kept;
-            }
+            results = kept0;
         }
 
-        console.log("==> 显示" + results.length + "条结果，隐藏库存为0:" + hiddenStock + "条，隐藏已达上限:" + hiddenQuota + "条");
+        // 第二层:详情检测(兑换限制 + 兑换要求)
+        if (results.length > 0 && (filterSoldOut || filterRedeemable)) {
+            updateFilterStatus({ loading: true });
+
+            // 并发拉详情读"兑换限制/来源/兑换要求"(并发5,缓存30分钟)
+            await runWithConcurrency(results, 5, async function(gift) {
+                await fetchGiftInfo(gift.id, gift.name);
+            });
+            chrome.storage.local.set({ 'giftInfoCacheV2': giftInfoCache });
+
+            // "仅看可兑换"还需要用户数据(金币 + 漏洞记录)
+            var user = null;
+            if (filterRedeemable) {
+                user = await fetchUserData();
+            }
+
+            var kept = [];
+            results.forEach(function(gift) {
+                var info = giftInfoCache[gift.id];
+
+                // 已达兑换上限 => 不能兑换
+                if (info && info.limit > 0 && info.redeemed >= info.limit) {
+                    hiddenQuota++;
+                    return;
+                }
+
+                if (filterRedeemable && user) {
+                    // 金币不足 => 买不起
+                    if (user.coinsOk && user.coins !== null && gift.price > user.coins) {
+                        hiddenCoins++;
+                        return;
+                    }
+                    // 兑换要求(严格模式):
+                    //   UNEVALUABLE = Rank/分数类或解析不了的要求 -> 无法确认能兑 -> 隐藏
+                    //   EVALUABLE   = 与漏洞列表比对,不满足 -> 隐藏
+                    //   NONE        = 无漏洞要求,仅金币/上限约束
+                    if (user.vulnsOk && info) {
+                        if (info.reqType === 'UNEVALUABLE') {
+                            hiddenReq++;
+                            return;
+                        }
+                        if (info.reqType === 'EVALUABLE' && !meetsRequirement(info.req, info.schools, user.vulns)) {
+                            hiddenReq++;
+                            return;
+                        }
+                    }
+                }
+
+                kept.push(gift);
+            });
+            results = kept;
+        }
+
+        console.log("==> 显示" + results.length + "条，隐藏: 库存0-" + hiddenStock + " 上限-" + hiddenQuota + " 金币-" + hiddenCoins + " 要求-" + hiddenReq);
         displayResults(results);
-        updateFilterStatus({ shown: results.length, hiddenStock: hiddenStock, hiddenQuota: hiddenQuota });
+        updateFilterStatus({ shown: results.length, hiddenStock: hiddenStock, hiddenQuota: hiddenQuota, hiddenCoins: hiddenCoins, hiddenReq: hiddenReq });
     } finally {
         isSearching = false;
     }
@@ -346,7 +534,7 @@ function displayResults(results) {
     if (results.length === 0) {
         var emptyLi = document.createElement('li');
         emptyLi.style.cssText = 'padding: 40px 20px; text-align: center; color: #999; font-size: 14px; width: 100%;';
-        emptyLi.textContent = filterSoldOut ? '没有可兑换的礼品（库存为0或已达兑换上限的已隐藏）' : '没有找到匹配的礼品';
+        emptyLi.textContent = (filterSoldOut || filterRedeemable) ? '没有符合兑换条件的礼品' : '没有找到匹配的礼品';
         container.appendChild(emptyLi);
         return;
     }
@@ -410,15 +598,16 @@ function restoreOriginalList() {
     }
 }
 
-// 根据开关状态更新"过滤已兑换"按钮样式
+// 根据开关状态更新按钮样式
 function updateFilterToggleStyle() {
     var toggles = document.querySelectorAll('.gift-filter-toggle');
     toggles.forEach(function(t) {
+        var on = t.dataset.filterKey === 'redeemable' ? filterRedeemable : filterSoldOut;
         var track = t.querySelector('.gf-track');
         var knob = t.querySelector('.gf-knob');
         if (!track || !knob) return;
 
-        if (filterSoldOut) {
+        if (on) {
             // 开启态：蓝色高亮，滑块靠右
             t.style.borderColor = '#3498db';
             t.style.background = '#eaf4fd';
@@ -436,11 +625,14 @@ function updateFilterToggleStyle() {
     });
 }
 
-// 创建"过滤已兑换"开关按钮
-function createFilterToggle() {
+// 创建过滤开关按钮
+function createFilterToggle(label, key) {
     var toggle = document.createElement('div');
     toggle.className = 'gift-filter-toggle';
-    toggle.title = '开启后隐藏库存为0，或个人已兑换数量达到限兑上限的礼品';
+    toggle.dataset.filterKey = key;
+    toggle.title = key === 'redeemable'
+        ? '开启后只显示：金币够、满足证书漏洞要求、未达兑换上限的礼品'
+        : '开启后隐藏库存为0或已达兑换上限的礼品';
 
     toggle.style.cssText = 'display: inline-flex; align-items: center; margin-left: 8px; padding: 7px 14px; border: 2px solid #e0e0e0; border-radius: 20px; background: #fafafa; color: #888; font-size: 13px; cursor: pointer; user-select: none; vertical-align: middle; transition: all 0.3s ease;';
 
@@ -457,7 +649,7 @@ function createFilterToggle() {
     // 文字
     var txt = document.createElement('span');
     txt.className = 'gf-txt';
-    txt.textContent = '过滤已兑换';
+    txt.textContent = label;
     txt.style.cssText = 'margin-left: 6px; white-space: nowrap;';
 
     track.appendChild(knob);
@@ -468,10 +660,17 @@ function createFilterToggle() {
     toggle.addEventListener('click', async function() {
         if (isSearching) return;
 
-        filterSoldOut = !filterSoldOut;
-        chrome.storage.local.set({ 'filterSoldOut': filterSoldOut }, function() {
-            console.log("==> 过滤已兑换开关已保存:", filterSoldOut);
-        });
+        if (key === 'redeemable') {
+            filterRedeemable = !filterRedeemable;
+            chrome.storage.local.set({ 'filterRedeemable': filterRedeemable }, function() {
+                console.log("==> 仅看可兑换开关已保存:", filterRedeemable);
+            });
+        } else {
+            filterSoldOut = !filterSoldOut;
+            chrome.storage.local.set({ 'filterSoldOut': filterSoldOut }, function() {
+                console.log("==> 过滤已兑换开关已保存:", filterSoldOut);
+            });
+        }
         updateFilterToggleStyle();
         await applyCurrentView();
     });
@@ -551,8 +750,9 @@ function addSearchBox() {
             }
         });
 
-        // 创建"过滤已兑换"开关按钮
-        var filterToggle = createFilterToggle();
+        // 创建两个过滤开关按钮
+        var toggleSoldOut = createFilterToggle('过滤已兑换', 'soldOut');
+        var toggleRedeemable = createFilterToggle('仅看可兑换', 'redeemable');
 
         // 创建状态提示
         var statusSpan = document.createElement('span');
@@ -562,7 +762,8 @@ function addSearchBox() {
         // 组装
         searchWrapper.appendChild(searchInput);
         searchWrapper.appendChild(searchButton);
-        searchWrapper.appendChild(filterToggle);
+        searchWrapper.appendChild(toggleSoldOut);
+        searchWrapper.appendChild(toggleRedeemable);
         searchWrapper.appendChild(statusSpan);
 
         // 在h2后面追加
@@ -594,22 +795,21 @@ observer.observe(document.body, {
 // 页面加载完成后预加载数据
 window.addEventListener('load', function() {
     setTimeout(function() {
-        chrome.storage.local.get(['giftCache', 'filterSoldOut', 'quotaCache'], function(data) {
-            // 恢复兑换限制缓存
-            if (data.quotaCache && typeof data.quotaCache === 'object') {
-                quotaCache = data.quotaCache;
-                console.log("==> 已恢复兑换限制缓存:", Object.keys(quotaCache).length, "条");
+        chrome.storage.local.get(['giftCache', 'filterSoldOut', 'filterRedeemable', 'giftInfoCacheV2'], function(data) {
+            // 恢复详情缓存
+            if (data.giftInfoCacheV2 && typeof data.giftInfoCacheV2 === 'object') {
+                giftInfoCache = data.giftInfoCacheV2;
+                console.log("==> 已恢复礼品详情缓存:", Object.keys(giftInfoCache).length, "条");
             }
 
             // 恢复过滤开关状态
-            if (typeof data.filterSoldOut === 'boolean') {
-                filterSoldOut = data.filterSoldOut;
-                updateFilterToggleStyle();
-                console.log("==> 已恢复过滤开关状态:", filterSoldOut);
-            }
+            if (typeof data.filterSoldOut === 'boolean') filterSoldOut = data.filterSoldOut;
+            if (typeof data.filterRedeemable === 'boolean') filterRedeemable = data.filterRedeemable;
+            updateFilterToggleStyle();
 
-            // 若上次开启过过滤，直接应用(内部会重新加载最新数据)
-            if (filterSoldOut) {
+            // 任一开关开启过 -> 自动应用(内部会重新加载最新数据)
+            if (filterSoldOut || filterRedeemable) {
+                console.log("==> 已恢复过滤开关: 过滤已兑换=" + filterSoldOut + ", 仅看可兑换=" + filterRedeemable);
                 applyCurrentView();
                 return;
             }
