@@ -3,8 +3,9 @@ var added = false;
 var cachedData = null;
 var searchInput = null;
 var searchButton = null;
-var originalList = null;
-var isSearching = false;
+var statusEl = null;
+var debounceTimer = null;
+var loadPromise = null;
 
 // 从页面解析礼品数据
 function parseGiftsFromPage(doc) {
@@ -141,6 +142,16 @@ function displayResults(results) {
         originalThumbnailsHTML = container.innerHTML;
     }
 
+    // 无匹配结果时给出提示
+    if (!results.length) {
+        container.innerHTML = '<li style="list-style:none; width:100%; padding:24px 0; text-align:center; color:#999; font-size:14px;">未找到相关礼品</li>';
+        var emptyPagination = document.querySelector('.pagination');
+        if (emptyPagination) {
+            emptyPagination.style.display = 'none';
+        }
+        return;
+    }
+
     // 获取原始li的模板
     var templateLi = container.querySelector('li');
     if (!templateLi) {
@@ -210,26 +221,76 @@ function restoreOriginalList() {
     }
 }
 
-// 执行搜索 -搜索所有分页数据
-async function doSearch() {
+// 输入防抖：停止输入 250ms 后自动搜索
+function onInputChange() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(doLiveSearch, 250);
+}
+
+// 确保全量礼品数据已加载（同一时间只加载一次）
+function ensureDataLoaded() {
+    if (cachedData && cachedData.length) {
+        return Promise.resolve(cachedData);
+    }
+    if (loadPromise) {
+        return loadPromise;
+    }
+
+    updateStatus('正在加载全部礼品数据…');
+
+    loadPromise = loadAllGifts().then(function(data) {
+        cachedData = data || [];
+    }).catch(function(e) {
+        console.log("==> 数据加载失败:", e);
+        cachedData = [];
+    }).then(function() {
+        loadPromise = null;
+        // 加载结束后，如果用户当前没有输入关键词，就清掉"正在加载"提示
+        if (!searchInput || !searchInput.value.trim()) {
+            updateStatus('');
+        }
+        return cachedData;
+    });
+
+    return loadPromise;
+}
+
+// 实时搜索：输入即筛选，无需点击
+async function doLiveSearch() {
+    if (!searchInput) return;
+
     var keyword = searchInput.value.trim();
 
     if (!keyword) {
         restoreOriginalList();
+        updateStatus('');
         return;
     }
 
-    // 强制重新加载最新数据
-    console.log("==> 正在重新加载数据...");
-    cachedData = await loadAllGifts();
+    var data = await ensureDataLoaded();
 
-    // 搜索缓存数据
-    var results = fuzzySearch(cachedData, keyword);
-    console.log("==>搜索'" + keyword + "'，找到" + results.length + "条结果");
+    // 等待期间输入可能已变化，重新读取一次
+    keyword = searchInput.value.trim();
+    if (!keyword) {
+        restoreOriginalList();
+        updateStatus('');
+        return;
+    }
+
+    var results = fuzzySearch(data, keyword);
+    console.log("==> 搜索'" + keyword + "'，找到" + results.length + "条结果");
     displayResults(results);
+    updateStatus('找到 ' + results.length + ' 条结果');
 }
 
-// 添加搜索框
+// 更新搜索状态提示
+function updateStatus(text) {
+    if (statusEl) {
+        statusEl.textContent = text || '';
+    }
+}
+
+// 添加搜索框（站点原生风格，只在标题后插入一次）
 function addSearchBox() {
     if (added) return;
 
@@ -240,85 +301,86 @@ function addSearchBox() {
         return;
     }
 
-    var h2Elements = document.querySelectorAll('h2');
-
-    for (var i = 0; i < h2Elements.length; i++) {
-        // 创建搜索框容器
-        var searchWrapper = document.createElement('div');
-        searchWrapper.style.cssText = 'display: inline-block; margin-left: 10px; vertical-align: middle;';
-
-        // 创建搜索框
-        searchInput = document.createElement('input');
-        searchInput.type = 'text';
-        searchInput.id = 'gift-search-input';
-        searchInput.placeholder = '搜索礼品...';
-        searchInput.style.cssText = 'padding: 8px 15px; border: 2px solid #e0e0e0; border-radius: 20px; outline: none; font-size: 14px; width: 180px; transition: all 0.3s ease; background: #fafafa;';
-
-        // 搜索框聚焦样式
-        searchInput.addEventListener('focus', function() {
-            this.style.borderColor = '#3498db';
-            this.style.width = '220px';
-            this.style.background = '#fff';
-            this.style.boxShadow = '0 0 8px rgba(52, 152, 219, 0.3)';
-        });
-        searchInput.addEventListener('blur', function() {
-            this.style.borderColor = '#e0e0e0';
-            this.style.width = '180px';
-            this.style.background = '#fafafa';
-            this.style.boxShadow = 'none';
-        });
-
-        // 创建搜索按钮
-        searchButton = document.createElement('button');
-        searchButton.id = 'gift-search-btn';
-        searchButton.innerHTML = '&#128269;';
-        searchButton.style.cssText = 'margin-left: 8px; padding: 8px 16px; border: none; border-radius: 20px; background: linear-gradient(135deg, #3498db, #2980b9); color: white; font-size: 16px; cursor: pointer; transition: all 0.3s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.1);';
-
-        // 搜索按钮悬停样式
-        searchButton.addEventListener('mouseover', function() {
-            this.style.transform = 'scale(1.05)';
-            this.style.boxShadow = '0 4px 10px rgba(52, 152, 219, 0.4)';
-        });
-        searchButton.addEventListener('mouseout', function() {
-            this.style.transform = 'scale(1)';
-            this.style.boxShadow = '0 2px 5px rgba(0,0,0,0.1)';
-        });
-        // 搜索按钮按下样式
-        searchButton.addEventListener('mousedown', function() {
-            this.style.transform = 'scale(0.95)';
-        });
-        searchButton.addEventListener('mouseup', function() {
-            this.style.transform = 'scale(1.05)';
-        });
-
-        // 绑定点击事件
-        searchButton.addEventListener('click', doSearch);
-
-        // 绑定回车事件
-        searchInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                doSearch();
-            }
-        });
-
-        // 组装
-        searchWrapper.appendChild(searchInput);
-        searchWrapper.appendChild(searchButton);
-
-        // 在h2后面追加
-        h2Elements[i].insertAdjacentElement('afterend', searchWrapper);
+    var title = document.querySelector('h2');
+    if (!title) {
+        console.log("==> 未找到标题，暂不添加搜索框");
+        return;
     }
 
-    if (h2Elements.length > 0) {
-        added = true;
-    }
+    // 外层容器：输入框与按钮拼成一个整体
+    // position+z-index：页面首屏渲染时证书列表（.pic 为 position:relative）会短暂上移压到搜索框，
+    // 这里让搜索框始终绘制在证书之上，避免被遮挡
+    var wrapper = document.createElement('span');
+    wrapper.id = 'gift-search-wrapper';
+    wrapper.style.cssText = 'position: relative; z-index: 50; display: inline-flex; align-items: center; vertical-align: middle; margin-left: 12px;';
+
+    // 输入框
+    searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'gift-search-input';
+    searchInput.placeholder = '输入关键词，实时筛选礼品…';
+    searchInput.autocomplete = 'off';
+    searchInput.style.cssText = 'box-sizing: border-box; height: 34px; width: 220px; padding: 0 12px; font-size: 13px; color: #333; background: #fff; border: 1px solid #ccc; border-right: none; border-radius: 3px 0 0 3px; outline: none; transition: border-color 0.2s ease;';
+    searchInput.addEventListener('focus', function() {
+        this.style.borderColor = '#0e90d2';
+    });
+    searchInput.addEventListener('blur', function() {
+        this.style.borderColor = '#ccc';
+    });
+
+    // 搜索按钮
+    searchButton = document.createElement('button');
+    searchButton.type = 'button';
+    searchButton.id = 'gift-search-btn';
+    searchButton.style.cssText = 'box-sizing: border-box; display: inline-flex; align-items: center; gap: 5px; height: 34px; padding: 0 14px; font-size: 13px; color: #fff; background: #0e90d2; border: 1px solid #0e90d2; border-radius: 0 3px 3px 0; cursor: pointer; transition: background 0.2s ease;';
+    searchButton.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line></svg><span>搜索</span>';
+    searchButton.addEventListener('mouseover', function() {
+        this.style.background = '#0a7ab8';
+        this.style.borderColor = '#0a7ab8';
+    });
+    searchButton.addEventListener('mouseout', function() {
+        this.style.background = '#0e90d2';
+        this.style.borderColor = '#0e90d2';
+    });
+
+    // 状态提示（加载中 / 结果数量）
+    statusEl = document.createElement('span');
+    statusEl.id = 'gift-search-status';
+    statusEl.style.cssText = 'margin-left: 10px; font-size: 12px; color: #888; vertical-align: middle;';
+
+    // 实时搜索：输入即筛选
+    searchInput.addEventListener('input', onInputChange);
+    searchInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            clearTimeout(debounceTimer);
+            doLiveSearch();
+        }
+        if (e.key === 'Escape') {
+            this.value = '';
+            restoreOriginalList();
+            updateStatus('');
+        }
+    });
+
+    // 点击按钮立即搜索（跳过防抖）
+    searchButton.addEventListener('click', function() {
+        clearTimeout(debounceTimer);
+        doLiveSearch();
+    });
+
+    wrapper.appendChild(searchInput);
+    wrapper.appendChild(searchButton);
+    wrapper.appendChild(statusEl);
+    title.insertAdjacentElement('afterend', wrapper);
+
+    added = true;
 }
 
 // 初始化
 addSearchBox();
 
 // 监听DOM变化
-var observer = new MutationObserver(function(mutations, obs) {
+var observer = new MutationObserver(function() {
     if (!added) {
         addSearchBox();
     }
@@ -329,17 +391,26 @@ observer.observe(document.body, {
     subtree: true
 });
 
-// 页面加载完成后预加载数据
-window.addEventListener('load', function() {
-    setTimeout(function() {
-        chrome.storage.local.get('giftCache', function(data) {
-            if (!data.giftCache || data.giftCache.length === 0) {
-                console.log("==> 开始预加载所有分页数据...");
-                loadAllGifts();
-            } else {
-                console.log("==> 使用缓存数据，共", data.giftCache.length, "条");
-                cachedData = data.giftCache;
+// 页面加载完成后在后台预加载全量数据，让首次输入即可秒出结果
+function schedulePrefetch() {
+    var run = function() {
+        ensureDataLoaded().then(function(data) {
+            console.log("==> 数据就绪，共", data.length, "条");
+            // 若用户在加载完成前已输入，补一次搜索
+            if (searchInput && searchInput.value.trim()) {
+                doLiveSearch();
             }
         });
-    }, 1000);
+    };
+
+    // 等首屏资源（证书图片）加载稳定后再后台预取，避免抢带宽造成首屏卡顿
+    if (window.requestIdleCallback) {
+        window.requestIdleCallback(run, { timeout: 3000 });
+    } else {
+        setTimeout(run, 1500);
+    }
+}
+
+window.addEventListener('load', function() {
+    setTimeout(schedulePrefetch, 800);
 });
